@@ -1,30 +1,78 @@
 import re
 import time
+import os
 import json
 import logging
+import pandas as pd
+import requests
 from dataclasses import dataclass
 from typing import Optional, Iterable
-from urllib.parse import urljoin, urlparse
-
-import requests
+from urllib.parse import urljoin, urlparse, urlunparse
+from playwright.sync_api import sync_playwright
+from serpapi import GoogleSearch
+from openai import OpenAI
 from bs4 import BeautifulSoup
 
-# Optional: "web agent" browser automation (stronger for JS-heavy sites)
-# pip install playwright
-# playwright install
-try:
-    from playwright.sync_api import sync_playwright
-    PLAYWRIGHT_AVAILABLE = True
-except Exception:
-    PLAYWRIGHT_AVAILABLE = False
+
+# GOAL: AI Job Source agent
+# 1) From Linkedin job listing pages, crawl the company name and company website URL(You may utilize third party Linkedin crawler API if you need)
+# 2) From company website URL,use web agent to navigate to the career page URL
+# 3) From the career page, get one opening position's URL
+# 4) Return the results in format: company name,career page URL,open position's URL
 
 
-# -----------------------------
-# Models
-# -----------------------------
+# TODO: read from config
+_SERPER_API_KEY = os.environ["SERPER_API_KEY"]
+_OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+_EXAMPLES = [
+    "4365358530",
+    "4342555572",
+    "4306115994",
+    "4326760101",
+    "4361769350",
+    "4364972673",
+    "4115499029",
+    "4367451488",
+    "4342953214",
+    "4332433653"
+
+]
+_BAD_DOMAINS = [
+    "linkedin.com",
+    "wikipedia.org",
+    "glassdoor.com",
+    "indeed.com",
+    "crunchbase.com",
+    "pitchbook.com",
+    "zoominfo.com",
+    "facebook.com",
+    "twitter.com",
+]
+_DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+_COMMON_CAREERS_PATH_HINTS = (
+    "/careers",
+    "/career",
+    "/jobs",
+    "/job",
+    "/join",
+    "/join-us",
+    "/work-with-us",
+    "/about/careers",
+    "/company/careers",
+    "/open-roles",
+)
+_CAREER_KEYWORDS = re.compile(r"\b(careers?|jobs?|join|openings|vacancies|work with us)\b", re.I)
+
 
 @dataclass(frozen=True)
 class JobSourceResult:
+    job_title: str
     company_name: str
     career_page_url: str
     open_position_url: str
@@ -36,58 +84,52 @@ class CompanyInfo:
     company_website_url: str
 
 
-# -----------------------------
-# Config
-# -----------------------------
-
-DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-COMMON_CAREERS_PATH_HINTS = (
-    "/careers",
-    "/career",
-    "/jobs",
-    "/job",
-    "/join",
-    "/join-us",
-    "/work-with-us",
-    "/about/careers",
-    "/company/careers",
-)
-
-# If you find these words in link text/href, it’s likely the careers page
-CAREER_KEYWORDS = re.compile(r"\b(careers?|jobs?|join|openings|vacancies|work with us)\b", re.I)
-
-# If a URL contains these, it’s likely a job posting link
-JOB_POSTING_HINTS = re.compile(r"\b(job|jobs|careers|position|opening|vacancy|req|requisition)\b", re.I)
+def is_valid_company_domain(url: str, company_name: str) -> bool:
+    domain = urlparse(url).netloc.lower()
+    if any(bad in domain for bad in _BAD_DOMAINS):
+        return False
+    tokens = company_name.lower().replace(",", "").split()
+    return any(token in domain for token in tokens)
 
 
-# -----------------------------
-# Utilities
-# -----------------------------
+def search_company_website(company_name):
+    params = {
+        "engine": "google",
+        "q":  f"{company_name} official website",
+        "google_domain": "google.com",
+        "hl": "en",
+        "gl": "us",
+        "api_key": _SERPER_API_KEY
+    }
+    search = GoogleSearch(params)
+    results = search.get_dict()
+    organic = results.get("organic_results", [])
+    for result in organic:
+        link = result.get("link")
+        if not link:
+            continue
 
-def normalize_url(url: str) -> str:
+        if is_valid_company_domain(link, company_name):
+            return clean_root(link)
+    return None
+
+
+def normalize_url(url):
     url = url.strip()
     if not url:
         return url
-    # Add scheme if missing
     parsed = urlparse(url)
     if not parsed.scheme:
         url = "https://" + url.lstrip("/")
     return url
 
 
-def same_domain(a: str, b: str) -> bool:
+def same_domain(a, b):
     return urlparse(a).netloc.lower() == urlparse(b).netloc.lower()
 
 
-def fetch_html(url: str, timeout_s: int = 20) -> str:
-    r = requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout_s, allow_redirects=True)
+def fetch_html(url, timeout_s=20):
+    r = requests.get(url, headers=_DEFAULT_HEADERS, timeout=timeout_s, allow_redirects=True)
     r.raise_for_status()
     return r.text
 
@@ -100,7 +142,6 @@ def extract_links(html: str, base_url: str) -> list[tuple[str, str]]:
         href = a.get("href") or ""
         text = " ".join(a.get_text(" ", strip=True).split())
         abs_url = urljoin(base_url, href)
-        # Skip mailto/tel/javascript
         if abs_url.startswith(("mailto:", "tel:", "javascript:")):
             continue
         links.append((abs_url, text))
@@ -119,7 +160,7 @@ def pick_best_career_link(links: Iterable[tuple[str, str]], company_home: str) -
     other_hits = []
 
     for url, text in links:
-        if CAREER_KEYWORDS.search(url) or CAREER_KEYWORDS.search(text):
+        if _CAREER_KEYWORDS.search(url) or _CAREER_KEYWORDS.search(text):
             if same_domain(url, company_home):
                 same_domain_hits.append(url)
             else:
@@ -135,202 +176,226 @@ def pick_best_career_link(links: Iterable[tuple[str, str]], company_home: str) -
 def fallback_guess_career_page(company_home: str) -> Optional[str]:
     """Try common careers paths."""
     company_home = normalize_url(company_home)
-    for path in COMMON_CAREERS_PATH_HINTS:
+    print("company home", company_home)
+    for path in _COMMON_CAREERS_PATH_HINTS:
         candidate = urljoin(company_home.rstrip("/") + "/", path.lstrip("/"))
         try:
-            r = requests.head(candidate, headers=DEFAULT_HEADERS, timeout=10, allow_redirects=True)
+            r = requests.head(candidate, headers=_DEFAULT_HEADERS, timeout=10, allow_redirects=True)
             if 200 <= r.status_code < 400:
-                return r.url  # final URL after redirects
+                return r.url
         except Exception:
             continue
+
+        try:
+            r = requests.head("careers." + company_home, headers=_DEFAULT_HEADERS, timeout=10, allow_redirects=True)
+            if 200 <= r.status_code < 400:
+                return r.url
+        except Exception:
+            continue
+
     return None
 
 
-def pick_one_job_posting_link(links: Iterable[tuple[str, str]], career_page_url: str) -> Optional[str]:
-    """
-    Pick one opening position link from the career page.
-    Heuristic:
-      - prefer same-domain
-      - prefer URLs containing job hints
-      - avoid navigation links (privacy, terms, etc.)
-    """
-    bad_words = re.compile(r"\b(privacy|terms|cookies|linkedin|facebook|twitter|instagram)\b", re.I)
-
-    candidates = []
-    for url, text in links:
-        if bad_words.search(url) or bad_words.search(text):
-            continue
-        if JOB_POSTING_HINTS.search(url) or JOB_POSTING_HINTS.search(text):
-            score = 0
-            if same_domain(url, career_page_url):
-                score += 2
-            if "apply" in url.lower() or "apply" in text.lower():
-                score += 1
-            candidates.append((score, url))
-
-    if not candidates:
-        return None
-    candidates.sort(key=lambda t: t[0], reverse=True)
-    return candidates[0][1]
+def extract_company_from_title(title: str) -> str:
+    if " hiring " in title:
+        return title.split(" hiring ")[0].strip()
+    return None
 
 
-# -----------------------------
-# LinkedIn extraction (two options)
-# -----------------------------
-
-def get_company_info_from_linkedin_via_api(linkedin_job_url: str) -> CompanyInfo:
-    """
-    Template for using a third-party LinkedIn crawler API (recommended).
-    Replace with your provider call.
-
-    Expected output: company name + company website URL.
-    """
-    # EXAMPLE STUB (pseudo):
-    # api_key = os.environ["YOUR_PROVIDER_KEY"]
-    # resp = requests.get(
-    #   "https://api.provider.com/linkedin/job",
-    #   params={"url": linkedin_job_url},
-    #   headers={"Authorization": f"Bearer {api_key}"},
-    #   timeout=30
-    # )
-    # resp.raise_for_status()
-    # data = resp.json()
-    # return CompanyInfo(company_name=data["company"]["name"],
-    #                    company_website_url=data["company"]["website"])
-
-    raise NotImplementedError("Plug in your LinkedIn provider API here.")
+def clean_root(url: str) -> str:
+    p = urlparse(url)
+    return urlunparse((p.scheme, p.netloc, "", "", "", ""))
 
 
-def get_company_info_from_linkedin_best_effort_html(linkedin_job_url: str) -> CompanyInfo:
-    """
-    Best-effort parsing of LinkedIn job page HTML.
-    Often fails due to auth, dynamic content, bot protections.
-    Use only as fallback.
-    """
+def get_company_info_from_linkedin_best_effort_html(linkedin_job_url):
     html = fetch_html(linkedin_job_url)
     soup = BeautifulSoup(html, "html.parser")
-
-    # Heuristic: company name often appears in title/meta
     title = (soup.title.get_text(strip=True) if soup.title else "") or ""
-    # Example: "Software Engineer at CompanyName | LinkedIn"
-    m = re.search(r"\bat\s+(.+?)\s*\|\s*LinkedIn\b", title, re.I)
-    company_name = m.group(1).strip() if m else "Unknown Company"
-
-    # Website URL is rarely present in job page HTML. You may only get company profile URL.
-    # We'll try a couple guesses, but often you'll need the API.
-    company_website_url = ""
-    for a in soup.select("a[href]"):
-        href = a.get("href") or ""
-        # If any external link looks like a company homepage, grab it.
-        if href.startswith("http") and "linkedin.com" not in href:
-            company_website_url = href
-            break
-
-    if not company_website_url:
-        raise RuntimeError("Could not extract company website from LinkedIn HTML. Use a 3rd-party API.")
-
+    company_name = extract_company_from_title(title)
+    print("company name", company_name)
+    company_website_url = search_company_website(company_name)
+    print("company website", company_website_url)
     return CompanyInfo(company_name=company_name, company_website_url=company_website_url)
 
 
-# -----------------------------
-# Web agent to find career page + job opening
-# -----------------------------
-
-def find_career_page_url(company_website_url: str, use_playwright: bool = False) -> str:
+def find_career_page_url(company_website_url):
     company_website_url = normalize_url(company_website_url)
-
-    # Option A: requests + bs4 (fast, cheap)
-    if not use_playwright:
-        home_html = fetch_html(company_website_url)
-        links = extract_links(home_html, company_website_url)
-
-        career = pick_best_career_link(links, company_website_url)
-        if career:
-            return career
-
-        guessed = fallback_guess_career_page(company_website_url)
-        if guessed:
-            return guessed
-
-        raise RuntimeError("Could not find career page from homepage heuristics.")
-
-    # Option B: Playwright "web agent" (handles JS menus, dynamic content)
-    if not PLAYWRIGHT_AVAILABLE:
-        raise RuntimeError("Playwright not installed/available. pip install playwright && playwright install")
-
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page(user_agent=DEFAULT_HEADERS["User-Agent"])
-        page.goto(company_website_url, wait_until="domcontentloaded", timeout=45_000)
+        page = browser.new_page(user_agent=_DEFAULT_HEADERS["User-Agent"])
+        try:
+            page.goto(company_website_url, wait_until="domcontentloaded", timeout=45_000)
 
-        # Collect visible links
-        anchors = page.query_selector_all("a[href]")
-        candidates = []
-        for a in anchors:
-            href = a.get_attribute("href") or ""
-            text = (a.inner_text() or "").strip()
-            if CAREER_KEYWORDS.search(href) or CAREER_KEYWORDS.search(text):
-                candidates.append(urljoin(company_website_url, href))
-
-        browser.close()
-
-        if candidates:
-            return candidates[0]
-
+            # Collect visible links
+            anchors = page.query_selector_all("a[href]")
+            candidates = []
+            for a in anchors:
+                href = a.get_attribute("href") or ""
+                text = (a.inner_text() or "").strip()
+                if _CAREER_KEYWORDS.search(href) or _CAREER_KEYWORDS.search(text):
+                    candidates.append(urljoin(company_website_url, href))
+            browser.close()
+            if candidates:
+                return candidates[0]
+        except Exception:
+            print("playwright failure")
     guessed = fallback_guess_career_page(company_website_url)
     if guessed:
         return guessed
     raise RuntimeError("Could not find career page (Playwright + fallback).")
 
 
-def find_one_open_position_url(career_page_url: str, use_playwright: bool = False) -> str:
-    career_page_url = normalize_url(career_page_url)
+def fetch_page_html(url):
+    html = ""
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.goto(url, timeout=60_000)  # up to 60 seconds for navigation
+        try:
+            page.wait_for_load_state("networkidle")
+        except Exception:
+            print("faild to wait for network idle")
+        # page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        # page.wait_for_timeout(1500)
 
-    if not use_playwright:
-        html = fetch_html(career_page_url)
-        links = extract_links(html, career_page_url)
-        job_url = pick_one_job_posting_link(links, career_page_url)
-        if job_url:
-            return job_url
-        raise RuntimeError("Could not find a job posting link on the career page via HTML parsing.")
-
-    if not PLAYWRIGHT_AVAILABLE:
-        raise RuntimeError("Playwright not installed/available. pip install playwright && playwright install")
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(user_agent=DEFAULT_HEADERS["User-Agent"])
-        page.goto(career_page_url, wait_until="domcontentloaded", timeout=45_000)
-
-        anchors = page.query_selector_all("a[href]")
-        candidates = []
-        for a in anchors:
-            href = a.get_attribute("href") or ""
-            text = (a.inner_text() or "").strip()
-            abs_url = urljoin(career_page_url, href)
-
-            if JOB_POSTING_HINTS.search(abs_url) or JOB_POSTING_HINTS.search(text):
-                candidates.append(abs_url)
-
+        # Check frames first
+        # for frame in page.frames:
+        #     html += frame.content()
+        html += page.content()
         browser.close()
-
-        if candidates:
-            return candidates[0]
-
-    raise RuntimeError("Could not find a job posting link on the career page (Playwright).")
+    return html
 
 
-# -----------------------------
-# Orchestrator (the "agent")
-# -----------------------------
+def open_positions_agent(url):
+    print("jobs_site:", url)
+    client = OpenAI(api_key=_OPENAI_API_KEY)
+
+    def fetch_url(target_url):
+        return fetch_page_html(target_url)
+    
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "fetch_url",
+                "description": "Fetch raw HTML from a URL (used when jobs are embedded via iframe/ATS).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "Absolute URL to fetch"},
+                    },
+                    "required": ["url"],
+                },
+            },
+        }
+    ]
+
+    html = fetch_page_html(url)
+    # print(html)
+    # default = str({
+    #     "title": "No specific roles detected (check careers url)",
+    #     "url": url,
+    # })
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a web-scraping assistant. You read through web pages in order to find job postings.\n\n"
+
+                "GOAL\n"
+                "Return EXACTLY ONE job posting: a specific job title + a DIRECT URL to the job detail page.\n\n"
+
+                "WHAT COUNTS AS A REAL JOB POSTING\n"
+                "- A specific role title (e.g., 'Senior Software Engineer', 'Data Scientist II').\n"
+                "- The URL must open a job detail page.\n"
+                "- The job detail page should include at least ONE of:\n"
+                "  (a) responsibilities/duties\n"
+                "  (b) qualifications/requirements\n"
+                "  (c) an 'Apply' button/link\n"
+                "  (d) job description text\n\n"
+
+                "WHAT DOES NOT COUNT\n"
+                "- Careers home pages.\n"
+                "- Job search/listing pages with many roles.\n"
+                "- Category/department pages (Engineering, Sales, etc.) unless they already show a single job detail.\n"
+                "- Links/buttons like: 'Open Roles', 'Explore Roles', 'View Opportunities', 'Search Jobs', 'Job Postings'.\n\n"
+
+                "DETERMINISTIC SELECTION RULE (when multiple real jobs exist)\n"
+                "Choose the FIRST valid job detail link in DOM order (top-to-bottom, left-to-right).\n"
+                "If multiple links point to the same job, choose the shortest canonical URL.\n\n"
+
+                "NAVIGATION / TOOL RULES (use fetch_url)\n"
+                "You may call fetch_url ONLY when a real job detail page is NOT already present in the current HTML.\n"
+                "Call fetch_url for EXACTLY ONE target per step.\n\n"
+                "Fetch priority (first match wins):\n"
+                "1) If an iframe likely contains jobs or an ATS embed exists, fetch the iframe src (absolute URL).\n"
+                "2) Else, if there is an external ATS link/domain (Greenhouse, Lever, Workday, Ashby, SmartRecruiters, iCIMS, Taleo, BambooHR),\n"
+                "   fetch the most job-like URL (absolute) pointing there.\n"
+                "3) Else, fetch the most job-like internal link (absolute) whose href/text suggests jobs, e.g. contains:\n"
+                "   /jobs, /careers, /join-us, /open-roles, /positions, /opportunities.\n"
+                "4) Else, if only department/section links exist (Engineering, Sales, HR, etc.), fetch the FIRST such subsection link (absolute).\n"
+                "- Prefer URLs that look like a specific posting, e.g. contain: /job/, /jobs/, /positions/, 'gh_jid=', 'lever.co/', 'workday', 'ashby', 'icims'.\n"
+                "- Avoid pure filters/search pages unless they are the only path to reach a detail page.\n"
+                "- When in doubt, call fetch_url on the best available guess for a job post\n\n"
+
+                # "FINAL SELF-CHECK (must be true before you answer)\n"
+                # "- Title is a specific role (not generic CTA).\n"
+                # "- URL is a direct job detail page.\n"
+                # "- Output is valid JSON only.\n\n"
+
+                "OUTPUT\n"
+                "Return ONLY JSON:\n"
+                "- If found: {\"title\": \"...\", \"url\": \"...\"}\n"
+                "- If not found, make your best educated guess based on the evidence\n"
+            )
+
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Base URL: {url}\n\n"
+                f"HTML:\n{html}"
+            ),
+        },
+    ]
+
+    for _ in range(3):
+        resp = client.chat.completions.create(
+            model="gpt-4.1",
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",
+            temperature=0.0,
+            max_tokens=500,
+        )
+
+        msg = resp.choices[0].message
+        if msg.tool_calls:
+            messages.append(msg)
+            for tc in msg.tool_calls:
+                if tc.function.name == "fetch_url":
+                    args = json.loads(tc.function.arguments)
+                    # Make iframe URLs absolute if needed
+                    target = args["url"]
+                    target = urljoin(url, target)
+                    print(f"Looks like the jobs might be posted at {target}. Navigating there...")
+                    fetched_html = fetch_url(target)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": fetched_html,
+                    })
+                    
+            continue
+        return msg.content.strip()
+    return '{"no_jobs_found": true, "reason": "Exceeded tool hops"}'
+
 
 def run_ai_job_source_agent(
-    linkedin_job_url: str,
+    linkedin_job_url,
     *,
-    prefer_linkedin_api: bool = True,
-    use_playwright_for_web_agent: bool = False,
-    polite_delay_s: float = 0.8,
-) -> JobSourceResult:
+    polite_delay_s=0.01,
+):
     """
     Main pipeline. Returns:
       company_name, career_page_url, open_position_url
@@ -338,48 +403,53 @@ def run_ai_job_source_agent(
     logging.info("Starting agent for LinkedIn job URL: %s", linkedin_job_url)
 
     # 1) Company name + website
-    if prefer_linkedin_api:
-        try:
-            company = get_company_info_from_linkedin_via_api(linkedin_job_url)
-        except NotImplementedError:
-            # If you didn't plug in API yet, fallback
-            company = get_company_info_from_linkedin_best_effort_html(linkedin_job_url)
-    else:
-        company = get_company_info_from_linkedin_best_effort_html(linkedin_job_url)
+    
+    company = get_company_info_from_linkedin_best_effort_html(linkedin_job_url)
 
     time.sleep(polite_delay_s)
 
     # 2) Find career page
-    career_page_url = find_career_page_url(company.company_website_url, use_playwright=use_playwright_for_web_agent)
+    career_page_url = find_career_page_url(company.company_website_url)
 
     time.sleep(polite_delay_s)
 
     # 3) Find one opening position URL
-    open_position_url = find_one_open_position_url(career_page_url, use_playwright=use_playwright_for_web_agent)
+    res = json.loads(open_positions_agent(career_page_url))
+    print('res:', res)
+    open_position_url = res["url"]
+    job_title = res["title"]
 
     return JobSourceResult(
+        job_title=job_title,
         company_name=company.company_name,
         career_page_url=career_page_url,
         open_position_url=open_position_url,
     )
 
 
-# -----------------------------
-# Example usage
-# -----------------------------
-
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-
-    linkedin_url = "https://www.linkedin.com/jobs/view/<JOB_ID>/"
-
-    try:
-        result = run_ai_job_source_agent(
-            linkedin_url,
-            prefer_linkedin_api=True,              # recommended
-            use_playwright_for_web_agent=False,    # set True if websites are JS-heavy
-        )
-        # Output format requested:
-        print(result.company_name, result.career_page_url, result.open_position_url, sep=",")
-    except Exception as e:
-        logging.exception("Agent failed: %s", e)
+    final_results = []
+    for job_id in _EXAMPLES:
+        linkedin_url = f"https://www.linkedin.com/jobs/view/{job_id}/"
+        try:
+            result = run_ai_job_source_agent(linkedin_url)
+            print("-"*80)
+            print("\n\n")
+            print("RESULTS:")
+            print("Job title:", result.job_title )
+            print("INFO:")
+            print(f"{result.company_name}, {result.career_page_url}, {result.open_position_url}")
+            final_results.append({
+                "company": result.company_name,
+                "career_page": result.career_page_url,
+                "job title": result.job_title,
+                "job link": result.open_position_url
+            })
+            print("\n\n")
+            print("-"*80)
+        except Exception as e:
+            logging.exception("Agent failed: %s", e)
+    df = pd.DataFrame(final_results)
+    print(df)
+    df.to_csv("jobs.csv")
