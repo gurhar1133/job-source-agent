@@ -300,7 +300,7 @@ def open_positions_agent(url):
         {
             "role": "system",
             "content": (
-                "You are a web-scraping assistant. You read through web pages in order to find job postings.\n\n"
+                "You are a web-crawling assistant. You read through web pages in order to find job postings.\n\n"
 
                 "GOAL\n"
                 "Return EXACTLY ONE job posting: a specific job title + a DIRECT URL to the job detail page.\n\n"
@@ -346,7 +346,7 @@ def open_positions_agent(url):
                 "OUTPUT\n"
                 "Return ONLY JSON:\n"
                 "- If found: {\"title\": \"...\", \"url\": \"...\"}\n"
-                "- If not found, make your best educated guess based on the evidence\n"
+                "- If not found, make an educated guess based on the evidence. Indicate uncertainty in your response by adding a question mark to the job title.\n"
             )
 
         },
