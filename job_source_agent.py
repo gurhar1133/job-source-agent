@@ -24,6 +24,7 @@ from bs4 import BeautifulSoup
 # TODO: read from config
 _SERPER_API_KEY = os.environ["SERPER_API_KEY"]
 _OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+_AGENT_TRIES = 3
 _EXAMPLES = [
     "4365358530",
     "4342555572",
@@ -34,7 +35,10 @@ _EXAMPLES = [
     "4115499029",
     "4367451488",
     "4342953214",
-    "4332433653"
+    "4332433653",
+    "4366502518",
+    "4368904184",
+    "4362567404"
 
 ]
 _BAD_DOMAINS = [
@@ -245,8 +249,8 @@ def find_career_page_url(company_website_url):
     raise RuntimeError("Could not find career page (Playwright + fallback).")
 
 
-def fetch_page_html(url):
-    html = ""
+def fetch_page_contents(url):
+    links_content = ""
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         page = browser.new_page()
@@ -255,15 +259,22 @@ def fetch_page_html(url):
             page.wait_for_load_state("networkidle")
         except Exception:
             print("faild to wait for network idle")
-        # page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        # page.wait_for_timeout(1500)
-
-        # Check frames first
-        # for frame in page.frames:
-        #     html += frame.content()
-        html += page.content()
+        html_content = page.content()
+        inner_text_content = page.inner_text("body")
+        links = page.query_selector_all("a")
+        for link in links:
+            text = link.text_content()
+            href = link.get_attribute("href")
+            links_content += "\n\nLINKS AND THIER TEXT CONTENT:\n" + f"text:{text}\n" + f"href:{href}\n" 
         browser.close()
-    return html
+
+    return json.dumps(
+        {
+            "html_content": json.dumps(html_content),
+            "links_content": json.dumps(links_content),
+            "inner_text_content": json.dumps(inner_text_content),
+        }
+    )
 
 
 def open_positions_agent(url):
@@ -271,7 +282,7 @@ def open_positions_agent(url):
     client = OpenAI(api_key=_OPENAI_API_KEY)
 
     def fetch_url(target_url):
-        return fetch_page_html(target_url)
+        return fetch_page_contents(target_url)
     
     tools = [
         {
@@ -290,58 +301,41 @@ def open_positions_agent(url):
         }
     ]
 
-    html = fetch_page_html(url)
-    # print(html)
-    # default = str({
-    #     "title": "No specific roles detected (check careers url)",
-    #     "url": url,
-    # })
+    content = fetch_url(url)
+
     messages = [
         {
             "role": "system",
             "content": (
                 "You are a web-crawling assistant. You read through web pages in order to find job postings.\n\n"
-
                 "GOAL\n"
                 "Return EXACTLY ONE job posting: a specific job title + a DIRECT URL to the job detail page.\n\n"
-
                 "WHAT COUNTS AS A REAL JOB POSTING\n"
                 "- A specific role title (e.g., 'Senior Software Engineer', 'Data Scientist II').\n"
                 "- The URL must open a job detail page.\n"
-                "- The job detail page should include at least ONE of:\n"
-                "  (a) responsibilities/duties\n"
-                "  (b) qualifications/requirements\n"
-                "  (c) an 'Apply' button/link\n"
-                "  (d) job description text\n\n"
-
+                # "- The job detail page should include at least ONE of:\n"
+                # "  (a) responsibilities/duties\n"
+                # "  (b) qualifications/requirements\n"
+                # "  (c) an 'Apply' button/link\n"
+                # "  (d) job description text\n\n"
                 "WHAT DOES NOT COUNT\n"
                 "- Careers home pages.\n"
                 "- Job search/listing pages with many roles.\n"
                 "- Category/department pages (Engineering, Sales, etc.) unless they already show a single job detail.\n"
                 "- Links/buttons like: 'Open Roles', 'Explore Roles', 'View Opportunities', 'Search Jobs', 'Job Postings'.\n\n"
 
-                "DETERMINISTIC SELECTION RULE (when multiple real jobs exist)\n"
-                "Choose the FIRST valid job detail link in DOM order (top-to-bottom, left-to-right).\n"
-                "If multiple links point to the same job, choose the shortest canonical URL.\n\n"
-
                 "NAVIGATION / TOOL RULES (use fetch_url)\n"
                 "You may call fetch_url ONLY when a real job detail page is NOT already present in the current HTML.\n"
                 "Call fetch_url for EXACTLY ONE target per step.\n\n"
                 "Fetch priority (first match wins):\n"
-                "1) If an iframe likely contains jobs or an ATS embed exists, fetch the iframe src (absolute URL).\n"
+                "1) If an iframe likely contains jobs or an ATS embed exists, use fetch_url on the iframe src (absolute URL).\n"
                 "2) Else, if there is an external ATS link/domain (Greenhouse, Lever, Workday, Ashby, SmartRecruiters, iCIMS, Taleo, BambooHR),\n"
                 "   fetch the most job-like URL (absolute) pointing there.\n"
                 "3) Else, fetch the most job-like internal link (absolute) whose href/text suggests jobs, e.g. contains:\n"
                 "   /jobs, /careers, /join-us, /open-roles, /positions, /opportunities.\n"
                 "4) Else, if only department/section links exist (Engineering, Sales, HR, etc.), fetch the FIRST such subsection link (absolute).\n"
                 "- Prefer URLs that look like a specific posting, e.g. contain: /job/, /jobs/, /positions/, 'gh_jid=', 'lever.co/', 'workday', 'ashby', 'icims'.\n"
-                "- Avoid pure filters/search pages unless they are the only path to reach a detail page.\n"
                 "- When in doubt, call fetch_url on the best available guess for a job post\n\n"
-
-                # "FINAL SELF-CHECK (must be true before you answer)\n"
-                # "- Title is a specific role (not generic CTA).\n"
-                # "- URL is a direct job detail page.\n"
-                # "- Output is valid JSON only.\n\n"
 
                 "OUTPUT\n"
                 "Return ONLY JSON:\n"
@@ -354,19 +348,19 @@ def open_positions_agent(url):
             "role": "user",
             "content": (
                 f"Base URL: {url}\n\n"
-                f"HTML:\n{html}"
+                f"Web page content:\n{content}"
             ),
         },
     ]
 
-    for _ in range(3):
+    for _ in range(_AGENT_TRIES):
         resp = client.chat.completions.create(
             model="gpt-4.1",
             messages=messages,
             tools=tools,
             tool_choice="auto",
             temperature=0.0,
-            max_tokens=500,
+            # max_tokens=500,
         )
 
         msg = resp.choices[0].message
@@ -452,4 +446,4 @@ if __name__ == "__main__":
             logging.exception("Agent failed: %s", e)
     df = pd.DataFrame(final_results)
     print(df)
-    df.to_csv("jobs.csv")
+    df.to_csv("jobs2.csv")
