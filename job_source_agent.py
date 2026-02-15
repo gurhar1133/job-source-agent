@@ -38,8 +38,8 @@ _EXAMPLES = [
     "4332433653",
     "4366502518",
     "4368904184",
-    "4362567404"
-
+    "4362567404",
+    "4350867280",
 ]
 _BAD_DOMAINS = [
     "linkedin.com",
@@ -309,7 +309,7 @@ def open_positions_agent(url):
             "content": (
                 "You are a web-crawling assistant. You read through web pages in order to find job postings.\n\n"
                 "GOAL\n"
-                "Return EXACTLY ONE job posting: a specific job title + a DIRECT URL to the job detail page.\n\n"
+                "Return EXACTLY ONE job posting: a specific job title + a DIRECT URL to the job detail page (not just the current url).\n\n"
                 "WHAT COUNTS AS A REAL JOB POSTING\n"
                 "- A specific role title (e.g., 'Senior Software Engineer', 'Data Scientist II').\n"
                 "- The URL must open a job detail page.\n"
@@ -385,11 +385,7 @@ def open_positions_agent(url):
     return '{"no_jobs_found": true, "reason": "Exceeded tool hops"}'
 
 
-def run_ai_job_source_agent(
-    linkedin_job_url,
-    *,
-    polite_delay_s=0.01,
-):
+def run_ai_job_source_agent(linkedin_job_url):
     """
     Main pipeline. Returns:
       company_name, career_page_url, open_position_url
@@ -397,15 +393,10 @@ def run_ai_job_source_agent(
     logging.info("Starting agent for LinkedIn job URL: %s", linkedin_job_url)
 
     # 1) Company name + website
-    
     company = get_company_info_from_linkedin_best_effort_html(linkedin_job_url)
-
-    time.sleep(polite_delay_s)
 
     # 2) Find career page
     career_page_url = find_career_page_url(company.company_website_url)
-
-    time.sleep(polite_delay_s)
 
     # 3) Find one opening position URL
     res = json.loads(open_positions_agent(career_page_url))
@@ -446,4 +437,4 @@ if __name__ == "__main__":
             logging.exception("Agent failed: %s", e)
     df = pd.DataFrame(final_results)
     print(df)
-    df.to_csv("jobs2.csv")
+    df.to_csv("jobs3.csv")
