@@ -265,7 +265,7 @@ def fetch_page_contents(url):
         for link in links:
             text = link.text_content()
             href = link.get_attribute("href")
-            links_content += "\n\nLINKS AND THIER TEXT CONTENT:\n" + f"text:{text}\n" + f"href:{href}\n" 
+            links_content += "\n\nLINKS AND THEIR TEXT CONTENT:\n" + f"text:{text}\n" + f"href:{href}\n" 
         browser.close()
 
     return json.dumps(
